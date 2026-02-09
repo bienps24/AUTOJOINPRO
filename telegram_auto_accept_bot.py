@@ -41,7 +41,7 @@ if not ADMIN_ID:
     raise ValueError("ADMIN_ID environment variable is required!")
 
 # Conversation states
-WAITING_FOR_PHOTO, WAITING_FOR_TEXT, WAITING_FOR_BUTTON = range(3)
+WAITING_FOR_PHOTO, WAITING_FOR_TEXT, WAITING_FOR_BUTTON, WAITING_FOR_MORE_BUTTONS = range(4)
 
 # Database setup
 def init_db():
@@ -55,10 +55,19 @@ def init_db():
             id INTEGER PRIMARY KEY CHECK (id = 1),
             photo_file_id TEXT,
             message_text TEXT,
-            button_text TEXT,
-            button_url TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Table for ad buttons (support multiple buttons)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS ad_buttons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            button_text TEXT NOT NULL,
+            button_url TEXT NOT NULL,
+            button_order INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
@@ -93,12 +102,21 @@ def get_ad_config():
     """Get current ad configuration"""
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
-    c.execute('SELECT photo_file_id, message_text, button_text, button_url FROM ad_config WHERE id = 1')
+    c.execute('SELECT photo_file_id, message_text FROM ad_config WHERE id = 1')
     result = c.fetchone()
     conn.close()
     return result
 
-def set_ad_config(photo_file_id=None, message_text=None, button_text=None, button_url=None):
+def get_ad_buttons():
+    """Get all ad buttons"""
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute('SELECT button_text, button_url FROM ad_buttons ORDER BY button_order, id')
+    results = c.fetchall()
+    conn.close()
+    return results
+
+def set_ad_config(photo_file_id=None, message_text=None):
     """Set ad configuration"""
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
@@ -117,12 +135,6 @@ def set_ad_config(photo_file_id=None, message_text=None, button_text=None, butto
         if message_text is not None:
             updates.append('message_text = ?')
             params.append(message_text)
-        if button_text is not None:
-            updates.append('button_text = ?')
-            params.append(button_text)
-        if button_url is not None:
-            updates.append('button_url = ?')
-            params.append(button_url)
         
         if updates:
             updates.append('updated_at = CURRENT_TIMESTAMP')
@@ -131,18 +143,38 @@ def set_ad_config(photo_file_id=None, message_text=None, button_text=None, butto
     else:
         # Insert new
         c.execute('''
-            INSERT INTO ad_config (id, photo_file_id, message_text, button_text, button_url)
-            VALUES (1, ?, ?, ?, ?)
-        ''', (photo_file_id, message_text, button_text, button_url))
+            INSERT INTO ad_config (id, photo_file_id, message_text)
+            VALUES (1, ?, ?)
+        ''', (photo_file_id, message_text))
     
     conn.commit()
     conn.close()
 
+def add_ad_button(button_text, button_url, button_order=0):
+    """Add an ad button"""
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO ad_buttons (button_text, button_url, button_order)
+        VALUES (?, ?, ?)
+    ''', (button_text, button_url, button_order))
+    conn.commit()
+    conn.close()
+
+def clear_ad_buttons():
+    """Clear all ad buttons"""
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute('DELETE FROM ad_buttons')
+    conn.commit()
+    conn.close()
+
 def clear_ad_config():
-    """Clear ad configuration"""
+    """Clear ad configuration and buttons"""
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
     c.execute('DELETE FROM ad_config WHERE id = 1')
+    c.execute('DELETE FROM ad_buttons')
     conn.commit()
     conn.close()
 
@@ -376,19 +408,99 @@ async def receive_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return WAITING_FOR_BUTTON
     
-    # Save to database
-    photo_id = context.user_data.get('ad_photo')
-    ad_text = context.user_data.get('ad_text')
+    # Initialize button list if not exists
+    if 'ad_buttons' not in context.user_data:
+        context.user_data['ad_buttons'] = []
     
-    set_ad_config(
-        photo_file_id=photo_id,
-        message_text=ad_text,
-        button_text=button_text,
-        button_url=button_url
+    # Add button to list
+    context.user_data['ad_buttons'].append({
+        'text': button_text,
+        'url': button_url
+    })
+    
+    # Ask if they want to add more buttons
+    button_count = len(context.user_data['ad_buttons'])
+    await update.message.reply_text(
+        f"✅ Button #{button_count} added!\n\n"
+        "Want to add another button?\n"
+        "• Send another button: `Button Text | URL`\n"
+        "• Or send /done to finish",
+        parse_mode='Markdown'
     )
     
+    return WAITING_FOR_MORE_BUTTONS
+
+async def receive_more_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive additional buttons"""
+    text = update.message.text
+    
+    if '|' not in text:
+        await update.message.reply_text(
+            "❌ Invalid format. Please use:\n"
+            "`Button Text | https://example.com`\n"
+            "Or send /done to finish",
+            parse_mode='Markdown'
+        )
+        return WAITING_FOR_MORE_BUTTONS
+    
+    parts = text.split('|', 1)
+    button_text = parts[0].strip()
+    button_url = parts[1].strip()
+    
+    # Validate URL
+    if not button_url.startswith(('http://', 'https://', 't.me/')):
+        await update.message.reply_text(
+            "❌ Invalid URL. Must start with http://, https://, or t.me/"
+        )
+        return WAITING_FOR_MORE_BUTTONS
+    
+    # Add button to list
+    context.user_data['ad_buttons'].append({
+        'text': button_text,
+        'url': button_url
+    })
+    
+    button_count = len(context.user_data['ad_buttons'])
     await update.message.reply_text(
-        "✅ *Advertisement Setup Complete!*\n\n"
+        f"✅ Button #{button_count} added!\n\n"
+        "Want to add another button?\n"
+        "• Send another button: `Button Text | URL`\n"
+        "• Or send /done to finish",
+        parse_mode='Markdown'
+    )
+    
+    return WAITING_FOR_MORE_BUTTONS
+
+async def finish_ad_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Finish ad setup and save to database"""
+    # Save ad config to database
+    photo_id = context.user_data.get('ad_photo')
+    ad_text = context.user_data.get('ad_text')
+    ad_buttons = context.user_data.get('ad_buttons', [])
+    
+    # Clear existing buttons first
+    clear_ad_buttons()
+    
+    # Save ad config
+    set_ad_config(
+        photo_file_id=photo_id,
+        message_text=ad_text
+    )
+    
+    # Save buttons
+    for idx, button in enumerate(ad_buttons):
+        add_ad_button(
+            button_text=button['text'],
+            button_url=button['url'],
+            button_order=idx
+        )
+    
+    button_count = len(ad_buttons)
+    await update.message.reply_text(
+        f"✅ *Advertisement Setup Complete!*\n\n"
+        f"📸 Photo: {'Yes' if photo_id else 'No'}\n"
+        f"📝 Message: Yes\n"
+        f"🔘 Buttons: {button_count}\n\n"
         "Your ad will now be shown to all users who join groups/channels.\n\n"
         "Use /viewad to preview or /clearad to remove it.",
         parse_mode='Markdown'
@@ -400,27 +512,11 @@ async def receive_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def skip_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Skip button step"""
-    # Save to database without button
-    photo_id = context.user_data.get('ad_photo')
-    ad_text = context.user_data.get('ad_text')
+    # Initialize empty button list
+    context.user_data['ad_buttons'] = []
     
-    set_ad_config(
-        photo_file_id=photo_id,
-        message_text=ad_text,
-        button_text=None,
-        button_url=None
-    )
-    
-    await update.message.reply_text(
-        "✅ *Advertisement Setup Complete!*\n\n"
-        "Your ad will now be shown to all users who join groups/channels.\n\n"
-        "Use /viewad to preview or /clearad to remove it.",
-        parse_mode='Markdown'
-    )
-    
-    # Clear user data
-    context.user_data.clear()
-    return ConversationHandler.END
+    # Finish setup
+    return await finish_ad_setup(update, context)
 
 async def cancel_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel ad setup"""
@@ -443,15 +539,18 @@ async def viewad_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     
-    photo_id, message_text, button_text, button_url = ad_config
+    photo_id, message_text = ad_config
+    ad_buttons = get_ad_buttons()
     
     # Prepare preview message
     preview_text = "📺 *Current Advertisement Preview:*\n\n"
     
-    # Create keyboard if button exists
+    # Create keyboard if buttons exist
     reply_markup = None
-    if button_text and button_url:
-        keyboard = [[InlineKeyboardButton(button_text, url=button_url)]]
+    if ad_buttons:
+        keyboard = []
+        for button_text, button_url in ad_buttons:
+            keyboard.append([InlineKeyboardButton(button_text, url=button_url)])
         reply_markup = InlineKeyboardMarkup(keyboard)
     
     # Send preview
@@ -556,12 +655,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
         
-        photo_id, message_text, button_text, button_url = ad_config
+        photo_id, message_text = ad_config
+        ad_buttons = get_ad_buttons()
         
-        # Create keyboard if button exists
+        # Create keyboard if buttons exist
         reply_markup = None
-        if button_text and button_url:
-            keyboard = [[InlineKeyboardButton(button_text, url=button_url)]]
+        if ad_buttons:
+            keyboard = []
+            for button_text, button_url in ad_buttons:
+                keyboard.append([InlineKeyboardButton(button_text, url=button_url)])
             reply_markup = InlineKeyboardMarkup(keyboard)
         
         # Send preview
@@ -679,49 +781,24 @@ async def handle_chat_join_request(
         # Get ad configuration
         ad_config = get_ad_config()
         
-        # Send welcome message to the user (private message)
+        # Send messages to the user (private message)
         try:
-            if ad_config and ad_config[1]:  # If ad is configured
-                photo_id, message_text, button_text, button_url = ad_config
+            first_name = user.first_name or "User"
+            
+            # FIRST MESSAGE: Send ad if configured (SEPARATE MESSAGE)
+            if ad_config and ad_config[1]:
+                photo_id, message_text = ad_config
+                ad_buttons = get_ad_buttons()
                 
-                # Create keyboard
-                keyboard = []
+                # Create keyboard for ad buttons only
+                reply_markup = None
+                if ad_buttons:
+                    keyboard = []
+                    for button_text, button_url in ad_buttons:
+                        keyboard.append([InlineKeyboardButton(button_text, url=button_url)])
+                    reply_markup = InlineKeyboardMarkup(keyboard)
                 
-                # Add ad button if exists (with click tracking)
-                if button_text and button_url:
-                    keyboard.append([
-                        InlineKeyboardButton(
-                            button_text,
-                            url=button_url,
-                            callback_data=f"track_click_{user.id}"
-                        )
-                    ])
-                
-                # Add default buttons
-                keyboard.extend([
-                    [
-                        InlineKeyboardButton(
-                            "🔴 Click Here To Start 🔴",
-                            url=f"https://t.me/{BOT_USERNAME}?start=start"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "Add me to your group",
-                            url=f"https://t.me/{BOT_USERNAME}?startgroup=s&admin=invite_users"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "Add me to your channel",
-                            url=f"https://t.me/{BOT_USERNAME}?startchannel=s&admin=invite_users"
-                        )
-                    ]
-                ])
-                
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                # Send with photo or text
+                # Send ad message (with photo or text)
                 if photo_id:
                     await context.bot.send_photo(
                         chat_id=user.id,
@@ -735,45 +812,42 @@ async def handle_chat_join_request(
                         text=message_text,
                         reply_markup=reply_markup
                     )
-            else:
-                # Send default welcome message
-                first_name = user.first_name or "User"
-                
-                welcome_message = (
-                    f"Hello🎈 {first_name}!\n\n"
-                    "I Accept Join Requests Automatically\n"
-                    "Just ✨ Add Me To Your Channel ➕\n"
-                    "Click /start To Know More ⭐⭐\n\n"
-                    "🔴Click Here To Start🔴"
-                )
-                
-                keyboard = [
-                    [
-                        InlineKeyboardButton(
-                            "🔴Click Here To Start🔴",
-                            url=f"https://t.me/{BOT_USERNAME}?start=start"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "Add me to your group",
-                            url=f"https://t.me/{BOT_USERNAME}?startgroup=s&admin=invite_users"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "Add me to your channel",
-                            url=f"https://t.me/{BOT_USERNAME}?startchannel=s&admin=invite_users"
-                        )
-                    ]
+            
+            # SECOND MESSAGE: Always send default welcome message (SEPARATE MESSAGE)
+            welcome_message = (
+                f"Hello🎈 {first_name}!\n\n"
+                "I Accept Join Requests Automatically\n"
+                "Just ✨ Add Me To Your Channel ➕\n"
+                "Click /start To Know More ⭐⭐"
+            )
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "🔴 Click Here To Start 🔴",
+                        url=f"https://t.me/{BOT_USERNAME}?start=start"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Add me to your group",
+                        url=f"https://t.me/{BOT_USERNAME}?startgroup=s&admin=invite_users"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Add me to your channel",
+                        url=f"https://t.me/{BOT_USERNAME}?startchannel=s&admin=invite_users"
+                    )
                 ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await context.bot.send_message(
-                    chat_id=user.id,
-                    text=welcome_message,
-                    reply_markup=reply_markup
-                )
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=welcome_message,
+                reply_markup=reply_markup
+            )
                 
         except Exception as e:
             logger.warning(f"Could not send private message to user {user.id}: {e}")
@@ -804,6 +878,10 @@ def main() -> None:
             WAITING_FOR_BUTTON: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_button),
                 CommandHandler('skip', skip_button),
+            ],
+            WAITING_FOR_MORE_BUTTONS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_more_buttons),
+                CommandHandler('done', finish_ad_setup),
             ],
         },
         fallbacks=[CommandHandler('cancel', cancel_setup)],
